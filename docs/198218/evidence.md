@@ -58,3 +58,34 @@ update-activation admission path.
 4. Count `content-version` children for the same command in a container with the
    service masked (tool: `run-with-spawn-count.sh`).
 5. Repeat with the branch build. The expected delta is children: 2N -> 0.
+
+## 6. Function-level before/after on a real 208 MB copy (2026-11-18 06:52 MST)
+
+Both legs read the same copy of `openclaw.sqlite` (208,617,472 bytes, 13 `update_runs` rows).
+
+| Side   | What was measured                                                                                      | Calls | Per observation                 |
+| ------ | ------------------------------------------------------------------------------------------------------ | ----- | ------------------------------- |
+| Before | shipped `dist/infra/sqlite-source-revision.worker.js --openclaw-sqlite-readonly-child content-version` | 3     | **0.1267 s** (0.13, 0.12, 0.13) |
+| After  | branch `readAdmittedStateContentVersion`                                                               | 30    | **0.001191 s** (35.7 ms total)  |
+
+The shipped bundle exports the version function under minified names, so the before side is
+measured through the worker the release actually spawns. That is the real cost path, not a proxy.
+
+| Derived                                                      | Value                 |
+| ------------------------------------------------------------ | --------------------- |
+| Ratio per observation                                        | **106.4x**            |
+| Per guard (two observations)                                 | 0.2534 s → 0.00238 s  |
+| At the 15,600 guards implied by the reported 52-minute storm | **65.9 min → 37.2 s** |
+
+Formula: `total = guards * 2 * observation`; `ratio = before_observation / after_observation`.
+
+Scope of the claim: this measures the version observation only, which is exactly what the
+patch changes. It does not include the policy row read, and it does not claim the whole
+`doctor --fix` run becomes 37 seconds. It claims the admission cost stops scaling with the
+store and stops being the dominant term.
+
+Note on the container lane (same day): a 20-minute `doctor --fix` run on a copied state inside
+a container produced **0** `content-version` children and stalled in the agent-database
+integrity pass instead. Without systemd, doctor never takes the managed-service repair path
+where the storm lives, so the container cannot reproduce this bug. That negative result is
+recorded here rather than discarded.
