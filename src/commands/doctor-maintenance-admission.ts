@@ -7,6 +7,21 @@ import { createUpdateRunAdmissionReader } from "../infra/update-run-reader.js";
 import type { UpdateRunRecord } from "../infra/update-run-record.js";
 import { openDoctorStateSchemaReadAdmission } from "../state/openclaw-state-db-doctor-schema.js";
 
+/** A repair that keeps re-reading the ledger has stopped making progress. */
+const ADMISSION_OBSERVATION_BUDGET = 20_000;
+const ADMISSION_TIME_BUDGET_MS = 10 * 60_000;
+
+export class AdmissionBudgetExceededError extends Error {
+  constructor(phase: string, observations: number, elapsedMs: number) {
+    super(
+      `Update admission did not settle: ${observations} checks in ${elapsedMs} ms ` +
+        `(last phase ${phase}). The state ledger kept changing while admission was ` +
+        "evaluated. Stop other OpenClaw processes and retry.",
+    );
+    this.name = "AdmissionBudgetExceededError";
+  }
+}
+
 export function resolveDoctorUpdateAdmission(
   env: NodeJS.ProcessEnv,
   boundRunId?: string,
@@ -21,6 +36,16 @@ export function resolveDoctorUpdateAdmission(
     { env },
     openDoctorStateSchemaReadAdmission,
   );
+  const startedAtMs = Date.now();
+  let observations = 0;
+  const guard = <T>(phase: string, operation: () => T): T => {
+    observations += 1;
+    const elapsedMs = Date.now() - startedAtMs;
+    if (observations > ADMISSION_OBSERVATION_BUDGET || elapsedMs > ADMISSION_TIME_BUDGET_MS) {
+      throw new AdmissionBudgetExceededError(phase, observations, elapsedMs);
+    }
+    return operation();
+  };
   const readAdmission = () => {
     const runs = readRuns();
     const admission = inspectUpdateRepairDriverAdmission(runs, inheritedRunId);
@@ -55,12 +80,13 @@ export function resolveDoctorUpdateAdmission(
       : admission.runs.find((run) => run.runId === inheritedRunId);
   return {
     assertCurrent: () => {
-      readAdmission();
+      guard("assertCurrent", () => readAdmission());
     },
-    readContinuation: () => {
-      const current = readAdmission();
-      return current.kind === "continuation" ? current.run : undefined;
-    },
+    readContinuation: () =>
+      guard("readContinuation", () => {
+        const current = readAdmission();
+        return current.kind === "continuation" ? current.run : undefined;
+      }),
     recordContinuation: () => {
       const current = readAdmission();
       if (continuation?.steps.some((step) => step.step === "finalize:repair-continuation")) {

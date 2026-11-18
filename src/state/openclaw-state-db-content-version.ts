@@ -1,13 +1,44 @@
-import fs from "node:fs";
-import { readSqliteSourceContentVersionSync } from "../infra/sqlite-snapshot-source.js";
+import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { getOpenClawDatabaseMaintenanceScope } from "./openclaw-state-db-async-lifecycle.js";
 import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
-import { isExistingOpenClawStateSchema } from "./openclaw-state-db-schema-policy.js";
 import { existingPathOrUndefined } from "./openclaw-state-db.paths.js";
 
-const versions = new WeakMap<object, { fingerprint: string; version: string }>();
+/**
+ * Admission consumes ledger policy rows, so the version identifies the ledger rather
+ * than the bytes of the whole store. Cost is constant in database size: one read-only
+ * connection, one schema probe, and one aggregate over `update_runs`.
+ *
+ * A caller that needs to prove genuine source bytes still uses the artifact-preserving
+ * source readers; this value must not stand in for byte identity.
+ */
+function readLedgerContentVersion(pathname: string): string | undefined {
+  let database: ReturnType<typeof openNodeSqliteDatabase> | undefined;
+  try {
+    database = openNodeSqliteDatabase(pathname, { readOnly: true });
+    const schema = Number(
+      (database.prepare("PRAGMA user_version").get() as { user_version?: number } | undefined)
+        ?.user_version ?? 0,
+    );
+    const ledger = database
+      .prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'update_runs'",
+      )
+      .get() as { present?: number } | undefined;
+    if (!ledger?.present) {
+      return `${schema}:no-ledger`;
+    }
+    const rows = database
+      .prepare("SELECT COALESCE(MAX(rowid), 0) AS maxRowId, COUNT(*) AS rowCount FROM update_runs")
+      .get() as { maxRowId?: number; rowCount?: number } | undefined;
+    return `${schema}:${Number(rows?.maxRowId ?? 0)}:${Number(rows?.rowCount ?? 0)}`;
+  } catch {
+    return undefined;
+  } finally {
+    database?.close();
+  }
+}
 
-/** Returned metadata also invalidates rows when a write races cached hash selection. */
+/** Returned metadata invalidates cached rows when the ledger changes between reads. */
 export function readAdmittedStateContentVersion(
   pathname: string,
   env: NodeJS.ProcessEnv,
@@ -20,26 +51,7 @@ export function readAdmittedStateContentVersion(
   if (existingPathOrUndefined(pathname) === undefined) {
     return undefined;
   }
-  const scope = getOpenClawDatabaseMaintenanceScope();
-  const fingerprint = () => {
-    const canonical = fs.realpathSync.native(pathname);
-    return ["", "-wal", "-journal"]
-      .map((suffix) => {
-        const stat = fs.lstatSync(canonical + suffix, { bigint: true, throwIfNoEntry: false });
-        const identity = stat && [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs];
-        return `${canonical}:${identity?.join(":")}`;
-      })
-      .join("|");
-  };
-  const before = fingerprint();
-  const previous = scope && versions.get(scope);
-  const version =
-    previous?.fingerprint === before
-      ? previous.version
-      : readSqliteSourceContentVersionSync(pathname);
-  if (scope && version !== undefined && before === fingerprint()) {
-    versions.set(scope, { fingerprint: before, version });
-  }
+  const version = readLedgerContentVersion(pathname);
   assertCurrent();
-  return version && `${isExistingOpenClawStateSchema(pathname)}:${version}:${fingerprint()}`;
+  return version;
 }
